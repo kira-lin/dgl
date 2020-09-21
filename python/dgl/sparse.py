@@ -13,7 +13,7 @@ from .function import TargetCode
 use_tvm = True if 'DGLENGINE' in os.environ and os.getenv('DGLENGINE') == 'tvm' else False
 if use_tvm:
     import tvm
-    from .tvm import gsddmm, gspmm
+    from .tvm import gsddmm, gspmm, merge_spmm
 
 
 def infer_broadcast_shape(op, shp1, shp2):
@@ -255,6 +255,36 @@ compiled_gsddmm_kernels = {}
 partitioned_1d_graphs = {}
 partitioned_2d_graphs = {}
 
+def _merge_spmm(gidx, op, reduce_op, u, e):
+    if gidx.number_of_etypes() != 1:
+        raise DGLError("We only support gsddmm on graph with one edge type")
+    nnz = gidx.number_of_edges(0)
+    if nnz <= 0:
+        return None
+    ctx = F.context(u)
+    feat_type = F.dtype(u)
+    u_shp = F.shape(u)
+    indice_type = gidx.dtype
+    srctype, dsttype = gidx.metagraph.find_edge(0)
+    num_rows = gidx.number_of_nodes(dsttype)
+    num_cols = gidx.number_of_nodes(srctype)
+    target = F.device_type(ctx)
+    indptr, indices, edge_mapping = map(lambda x: tvm.nd.from_dlpack(x.to_dlpack()), \
+            gidx.get_csc_dlpack(0))
+    feat_len = u_shp[1]
+    key = ('merge', num_rows, num_cols, nnz, feat_len)
+    if key not in compiled_gspmm_kernels:
+        f = merge_spmm.merge_spmm(num_rows, num_cols, nnz, 'int32', 'float32', feat_len)
+        compiled_gspmm_kernels[key] = f
+    else:
+        f = compiled_gspmm_kernels[key]
+    v = F.zeros((num_rows, feat_len), feat_type, ctx)
+    u = tvm.nd.from_dlpack(to_dgl_nd(u).to_dlpack())
+    # v = tvm.nd.from_dlpack(to_dgl_nd_for_write(v).to_dlpack())
+    # e = e[F.zerocopy_from_dlpack(edge_mapping.to_dlpack()).long()]
+    # e = tvm.nd.from_dlpack(to_dgl_nd(e).to_dlpack())
+    f(indptr, indices, u, tvm.nd.from_dlpack(to_dgl_nd_for_write(v).to_dlpack()))
+    return v
 
 def _gspmm_tvm(gidx, op, reduce_op, u, e, advise=True,
                num_feat_partitions=1, num_col_partitions=1):
@@ -316,7 +346,7 @@ def _gspmm_tvm(gidx, op, reduce_op, u, e, advise=True,
     This function does not handle gradients.
     """
     if gidx.number_of_etypes() != 1:
-        raise DGLError("We only support gsddmm on graph with one edge type")
+        raise DGLError("We only support gspmm on graph with one edge type")
     nnz = gidx.number_of_edges(0)
     if nnz <= 0:
         return None
@@ -356,6 +386,7 @@ def _gspmm_tvm(gidx, op, reduce_op, u, e, advise=True,
         indptr, indices, edge_mapping = dds
     edge_shuffled = edge_mapping.shape != (0,)
     use_idx = edge_shuffled and use_e
+    # use_idx = False
     f_input = [indptr, indices]
     key = (num_rows, num_cols, nnz, op, reduce_op, u_shp, e_shp, use_idx, \
            num_feat_partitions, num_col_partitions, indice_type, feat_type, target)
@@ -371,6 +402,7 @@ def _gspmm_tvm(gidx, op, reduce_op, u, e, advise=True,
             num_feat_partitions=num_feat_partitions,
             num_col_partitions=num_col_partitions
         )
+        # print(mod.imported_modules[0].get_source())
         compiled = (mod, v_shp)
         compiled_gspmm_kernels[key] = compiled
     else:
