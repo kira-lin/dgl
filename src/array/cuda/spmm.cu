@@ -241,15 +241,19 @@ void SpMMCsr(const std::string& op, const std::string& reduce,
              std::vector<NDArray> out_aux) {
   int64_t feat_len = bcast.out_len;
   bool is_scalar_efeat = efeat.NumElements() == csr.indices->shape[0];
+  bool is_multihead = efeat->ndim == 3;
+  int num_heads = is_multihead ? efeat->shape[1] : 1;
   bool use_efeat = op != "copy_lhs";
 
   if (reduce == "sum") {
-    if ((!use_efeat || is_scalar_efeat) && feat_len > 64) {  // ge-spmm
-      if (use_efeat && !IsNullArray(csr.data))  // reorder edge data
-        efeat = IndexSelect(efeat, csr.data);
+    // if ((!use_efeat || is_scalar_efeat) && feat_len > 64) {  // ge-spmm
+    if (is_multihead) {
+      // LG << "use gespmm\n";
+      // if (use_efeat && !IsNullArray(csr.data))  // reorder edge data
+      //   efeat = IndexSelect(efeat, csr.data);
       SWITCH_OP(op, Op, {
-        cuda::GESpMMCsr<IdType, DType, Op>(
-          csr, ufeat, efeat, out, feat_len);
+        cuda::GESpMMCsr<IdType, DType, Op, cuda::reduce::Sum<IdType, DType> >(
+          csr, ufeat, efeat, out, out_aux[0], out_aux[1], feat_len, num_heads);
       });
     } else if (sizeof(IdType) == 4 && op == "copy_lhs") {  // cusparse
       int64_t x_length = 1;
